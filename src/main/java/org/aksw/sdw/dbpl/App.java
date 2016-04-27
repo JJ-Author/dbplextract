@@ -187,6 +187,7 @@ public class App
 			 
 			 r.db("dbplextract").table("dbpl16").insert(m).run(conn);
 		} 
+		conn.close();
 		
     }
     
@@ -225,25 +226,28 @@ public class App
 		    Model m = model.read(is, null, "N-TRIPLE"); //parse nt file
 		    
 		    //prepare stuff for parallel processing of the statements
+		    if (NUMBER_THREADS>0)
+		    	System.setProperty("java.util.concurrent.ForkJoinPool.common.parallelism", ""+NUMBER_THREADS);
 		    StmtIterator it = m.listStatements();
 		    Stream<Statement> targetStream = StreamSupport.stream(
 		    		Spliterators.spliteratorUnknownSize(it, Spliterator.ORDERED),false);
-		    
+
 		    //process the statements in parallel
 		    /*ForkJoinPool forkJoinPool = new ForkJoinPool(NUMBER_THREADS);
 			
-				forkJoinPool.submit(() -> targetStream.parallel().forEach( s -> handleStatement(s, date, added))
-				    //parallel task here, for example
-				    
-				);*/
+				try {
+					forkJoinPool.submit(() -> targetStream.parallel().forEach( s -> handleStatement(s, date, added))
+					    //parallel task here, for example
+					    
+					).get();
+				} catch (InterruptedException | ExecutionException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}*/
 			targetStream.parallel().forEach( s -> handleStatement(s, date, added));
 		}
 	
-	   /* ForkJoinPool forkJoinPool = new ForkJoinPool(8);
-		forkJoinPool.submit(() ->
-		    //parallel task here, for example
-		    
-		).get();*/
+
 		
 	}
     
