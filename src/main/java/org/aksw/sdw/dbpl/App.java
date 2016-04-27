@@ -99,8 +99,16 @@ public class App
 	    {
 			  Files.walkFileTree(p, fv);
 			  java.util.Collections.sort(file_list); // sort the list to process the files in the right (time) order 
+			  Path last_month=null; Path last_day=null;
 			  for (Path file : file_list) 
 			  {
+				  Path  day = file.toAbsolutePath().getParent().getParent(); Path month  = day.getParent();
+				  if (last_month==null || !last_month.equals(month))
+					  System.out.print("\nprocessing files in month "+month+"\n\tday"); 
+				  if (last_day==null || !last_day.equals(day))
+					  System.out.print(" "+day.getFileName());
+				  last_month = month;last_day=day;
+				  
 				  parseNTFile(file);
 			  }
 	    } catch (IOException e) {
