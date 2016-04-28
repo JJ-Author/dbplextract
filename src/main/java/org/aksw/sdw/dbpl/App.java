@@ -22,6 +22,7 @@ import org.apache.jena.rdf.model.ModelFactory;
 import org.apache.jena.rdf.model.Statement;
 import org.apache.jena.rdf.model.StmtIterator;
 import org.apache.jena.util.FileManager;
+import org.apache.log4j.Logger;
 
 import com.rethinkdb.RethinkDB;
 import com.rethinkdb.gen.exc.ReqlError;
@@ -47,10 +48,12 @@ public class App
 	public static String DIFFS_DIRECTORY ;
 	public static int RETHINK_PORT ;
 	public static int NUMBER_THREADS ;
+	public static int LOGGING ;
+	public static String RESUME_FILE;
 	
 	public static final RethinkDB r = RethinkDB.r;
 	public static Connection conn;
-
+	final static Logger logger = Logger.getLogger(App.class);
 	
     public static void main( String[] args )
     {
@@ -61,27 +64,32 @@ public class App
 		try {
 			new App().initConstantsFromPropValues();
 			conn = r.connection().hostname("localhost").port(RETHINK_PORT).connect();
-		} catch (TimeoutException e) {
+		} /*catch (TimeoutException e) {
 			// TODO Auto-generated catch block
 			e.printStackTrace();
 			conn =null;
-		} catch (IOException e) {
+		} */catch (IOException e) {
 			// TODO Auto-generated catch block
 			e.printStackTrace();
 		}
 		
 	//check if database exists and delete it if so and (re)create the tables and indeces
-		if( ((List<String>) r.dbList().run(conn)).contains("dbplextract") )
+		if (RESUME_FILE.equals(""))
 		{
-			r.db("dbplextract").tableDrop("dbpl16").run(conn); 
-			r.dbDrop("dbplextract").run(conn);
-		}																
-		r.dbCreate("dbplextract").run(conn);
-		r.db("dbplextract").tableCreate("dbpl16").run(conn);
-		r.db("dbplextract").table("dbpl16").indexCreate("spo",
-			    row -> r.array(row.g("s"), row.g("p"), row.g("o")) ).run(conn);
-		r.db("dbplextract").table("dbpl16").indexWait("spo").run(conn);
-		
+			if( ((List<String>) r.dbList().run(conn)).contains("dbplextract") )
+			{
+				r.db("dbplextract").tableDrop("dbpl16").run(conn); 
+				r.dbDrop("dbplextract").run(conn);
+			}	
+			r.dbCreate("dbplextract").run(conn);
+			r.db("dbplextract").tableCreate("dbpl16").run(conn);
+			
+			//r.db("dbplextract").table("dbpl16").indexCreate("hash").run(conn);
+			//r.db("dbplextract").table("dbpl16").indexWait("hash").run(conn);
+			r.db("dbplextract").table("dbpl16").indexCreate("spo",
+				    row -> r.array(row.g("s"), row.g("p"), row.g("o")) ).run(conn);
+			r.db("dbplextract").table("dbpl16").indexWait("spo").run(conn);
+		}
 
     
     	
@@ -100,17 +108,28 @@ public class App
 			  Files.walkFileTree(p, fv);
 			  java.util.Collections.sort(file_list); // sort the list to process the files in the right (time) order 
 			  Path last_month=null; Path last_day=null;
+			  boolean skip =  (!RESUME_FILE.equals("")) ? true : false;
+				  
 			  for (Path file : file_list) 
 			  {
+				  if (skip)
+				  {
+					  if (file.toAbsolutePath().toString().equals(RESUME_FILE))
+						  skip=false;
+					  continue;
+				  }
 				  Path  day = file.toAbsolutePath().getParent().getParent(); Path month  = day.getParent();
 				  if (last_month==null || !last_month.equals(month))
 					  System.out.print("\nprocessing files in month "+month+"\n\tday"); 
 				  if (last_day==null || !last_day.equals(day))
 					  System.out.print(" "+day.getFileName());
 				  last_month = month;last_day=day;
-				  
+				  if(LOGGING>0){
+						logger.info(file.toAbsolutePath().toString());
+					} 	
 				  parseNTFile(file);
 			  }
+			  System.out.println("finish");
 	    } catch (IOException e) {
 	      e.printStackTrace();
 	    }
@@ -121,15 +140,15 @@ public class App
     public static void handleStatement(Statement st, String date, boolean adding)
     {
     //parse Triple line
-    	RethinkDB r = RethinkDB.r;
-    	Connection conn=null; 
-    	try {
-			conn = r.connection().hostname("localhost").port(RETHINK_PORT).connect();
-		} catch (TimeoutException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
-			conn =null;
-		} 
+//    	RethinkDB r = RethinkDB.r;
+//    	Connection conn=null; 
+//    	try {
+//			conn = r.connection().hostname("localhost").port(RETHINK_PORT).connect();
+//		} /*catch (TimeoutException e) {
+//			// TODO Auto-generated catch block
+//			e.printStackTrace();
+//			conn =null;
+//		} */ finally {}
     	String s = st.asTriple().getSubject().toString();
 		String p = st.asTriple().getPredicate().toString();
 		String o = st.asTriple().getObject().toString();
@@ -195,7 +214,7 @@ public class App
 			 
 			 r.db("dbplextract").table("dbpl16").insert(m).run(conn);
 		} 
-		conn.close();
+		//conn.close();
 		
     }
     
@@ -275,6 +294,8 @@ public class App
 			DIFFS_DIRECTORY = prop.getProperty("diffs_directory");
 			RETHINK_PORT = Integer.parseInt(prop.getProperty("rethink_port"));
 			NUMBER_THREADS = Integer.parseInt(prop.getProperty("number_threads"));
+			LOGGING = Integer.parseInt(prop.getProperty("logging"));
+			RESUME_FILE = prop.getProperty("resume_file");
 			
 					
 		} catch (Exception e) {
