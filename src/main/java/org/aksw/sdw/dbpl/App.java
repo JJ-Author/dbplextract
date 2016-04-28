@@ -5,6 +5,7 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Properties;
@@ -57,12 +58,12 @@ public class App
 	
     public static void main( String[] args )
     {
-    	
     	List<Path> file_list = new ArrayList<Path>();
     	
     //read config file and try to connect to rethinkdb database
 		try {
 			new App().initConstantsFromPropValues();
+			logger.info("started with resuming at "+RESUME_FILE);
 			conn = r.connection().hostname("localhost").port(RETHINK_PORT).connect();
 		} /*catch (TimeoutException e) {
 			// TODO Auto-generated catch block
@@ -129,10 +130,13 @@ public class App
 					} 	
 				  parseNTFile(file);
 			  }
-			  System.out.println("finish");
+			  System.out.println("\nfinished");
 	    } catch (IOException e) {
 	      e.printStackTrace();
 	    }
+	    finally {
+			conn.close();
+		}
 
     }
    
