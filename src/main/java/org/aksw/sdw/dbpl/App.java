@@ -1,45 +1,32 @@
 package org.aksw.sdw.dbpl;
 
-import java.nio.file.*;
-import java.nio.file.attribute.BasicFileAttributes;
-import java.security.MessageDigest;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Properties;
-import java.util.Spliterator;
-import java.util.Spliterators;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.TimeoutException;
-import java.util.stream.Stream;
-import java.util.stream.StreamSupport;
-
-import org.apache.jena.ext.com.google.common.collect.Lists;
-import org.apache.jena.rdf.model.Model;
-import org.apache.jena.rdf.model.ModelFactory;
-import org.apache.jena.rdf.model.Statement;
-import org.apache.jena.rdf.model.StmtIterator;
-import org.apache.jena.util.FileManager;
-import org.apache.log4j.Logger;
-
-import com.rethinkdb.RethinkDB;
-import com.rethinkdb.gen.exc.ReqlError;
-import com.rethinkdb.gen.exc.ReqlQueryLogicError;
-import com.rethinkdb.model.MapObject;
-import com.rethinkdb.net.Connection;
-import com.rethinkdb.net.Cursor;
-
 import java.io.BufferedReader;
 import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStream;
-import java.lang.System;
+import java.nio.file.FileVisitResult;
+import java.nio.file.FileVisitor;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Properties;
 
+import org.apache.flink.api.java.DataSet;
+import org.apache.flink.api.java.ExecutionEnvironment;
+import org.apache.flink.api.java.operators.DataSource;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.core.fs.FileSystem.WriteMode;
+import org.apache.flink.util.Collector;
+import org.apache.log4j.Logger;
 
+import com.google.gson.Gson;
 
 /**
  *
@@ -52,48 +39,23 @@ public class App
 	public static int LOGGING ;
 	public static String RESUME_FILE;
 	
-	public static final RethinkDB r = RethinkDB.r;
-	public static Connection conn;
 	final static Logger logger = Logger.getLogger(App.class);
+	final static ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
+	static DataSet<Tuple2<String,String>> d;
 	
     public static void main( String[] args )
     {
     	List<Path> file_list = new ArrayList<Path>();
-    	
-    //read config file and try to connect to rethinkdb database
+    //read config file 
 		try {
 			new App().initConstantsFromPropValues();
 			logger.info("started with resuming at "+RESUME_FILE);
-			conn = r.connection().hostname("localhost").port(RETHINK_PORT).connect();
-		} /*catch (TimeoutException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
-			conn =null;
-		} */catch (IOException e) {
+		}
+		catch (IOException e) {
 			// TODO Auto-generated catch block
 			e.printStackTrace();
 		}
-		
-	//check if database exists and delete it if so and (re)create the tables and indeces
-		if (RESUME_FILE.equals(""))
-		{
-			if( ((List<String>) r.dbList().run(conn)).contains("dbplextract") )
-			{
-				r.db("dbplextract").tableDrop("dbpl16").run(conn); 
-				r.dbDrop("dbplextract").run(conn);
-			}	
-			r.dbCreate("dbplextract").run(conn);
-			r.db("dbplextract").tableCreate("dbpl16").run(conn);
-			
-			//r.db("dbplextract").table("dbpl16").indexCreate("hash").run(conn);
-			//r.db("dbplextract").table("dbpl16").indexWait("hash").run(conn);
-			r.db("dbplextract").table("dbpl16").indexCreate("spo",
-				    row -> r.array(row.g("s"), row.g("p"), row.g("o")) ).run(conn);
-			r.db("dbplextract").table("dbpl16").indexWait("spo").run(conn);
-		}
-
-    
-    	
+		    	
 	//process all added.nt and removed.nt files recursively in specified directory (tree)
 	    Path p = Paths.get(DIFFS_DIRECTORY);
 	    FileVisitor<Path> fv = new SimpleFileVisitor<Path>() {
@@ -110,7 +72,9 @@ public class App
 			  java.util.Collections.sort(file_list); // sort the list to process the files in the right (time) order 
 			  Path last_month=null; Path last_day=null;
 			  boolean skip =  (!RESUME_FILE.equals("")) ? true : false;
-				  
+			
+			  System.out.println("Processing all DBPedia live diff files and creating Flink Map Jobs");
+			  
 			  for (Path file : file_list) 
 			  {
 				  if (skip)
@@ -119,6 +83,7 @@ public class App
 						  skip=false;
 					  continue;
 				  }
+				  
 				  Path  day = file.toAbsolutePath().getParent().getParent(); Path month  = day.getParent();
 				  if (last_month==null || !last_month.equals(month))
 					  System.out.print("\nprocessing files in month "+month+"\n\tday"); 
@@ -128,31 +93,108 @@ public class App
 				  if(LOGGING>0){
 						logger.info(file.toAbsolutePath().toString());
 					} 	
-				  parseNTFile(file);
+				  handleNTFile(file);
 			  }
-			  System.out.println("\nfinished");
+			  System.out.println("\ncreating Flink Map Jobs finished");
+		
+		// REDUCE PHASE 
+			  DataSet<String> result =  
+					  d.groupBy(0).reduceGroup( 
+							 (Iterable<Tuple2<String, String>> it,Collector<String> out)-> { 
+								  Iterator<Tuple2<String, String>> itt = it.iterator();
+								  List<String> list = new ArrayList<>();
+								  Tuple2<String, String> t = itt.next();
+								  String tmp = t.f0+"\t";list.add(t.f1);
+								  while(itt.hasNext()){
+								    list.add(itt.next().f1);
+								  }
+								  /*List<String> list = new ArrayList<>();
+								  it.forEach(x-> list.add(x.f0)); //copy the iterator to list to sort it*/
+								  Collections.sort(list);
+								  out.collect(tmp+retrieveMetadataString(list));
+							  }
+					  ).returns(String.class);
+			  try {
+//				System.out.println("map:");
+//				d.print();
+//				System.out.println("reduce:");
+//				result.print();
+				result.writeAsText("test.txt",WriteMode.OVERWRITE);//.setParallelism(1);
+				env.execute();
+			} catch (Exception e) {
+				// TODO Auto-generated catch block
+				System.out.println("ERROR:");
+				e.printStackTrace();
+			}
+			  
+			  
+			 // Collector<Tuple2<String, Integer>>
 	    } catch (IOException e) {
 	      e.printStackTrace();
 	    }
-	    finally {
-			conn.close();
-		}
 
     }
-   
     
+    
+    
+    public static String retrieveMetadataString(List<String> list)
+    {
+    	
+    	
+    
+    	Metadata m = new Metadata();
+    	for (String s : list) 
+    	{
+			boolean adding = s.charAt(s.length()-1) == 'a';
+			String date = s.substring(0, s.length()-2);
+			
+			if(m.validities.size()==0) // if validity list is empty
+			{
+				if (adding)
+				{
+					m.validities.add(m.new Validity(date,""));
+					m.added.add(date);
+				}	 
+				else
+				{
+					 m.validities.add(m.new Validity("#UNKNOWN#",date));
+					 m.deleted.add(date);
+				}
+			}
+			else
+			{
+				if (adding)
+				{
+			    	m.added.add(date);
+					if (m.validities.peekLast().validUntil.equals("")) // triple is re-added  without being removed 
+						m.add_anomalies.add(date);
+					else
+					{
+						m.validities.add(m.new Validity(date, ""));
+					}
+				}
+				else
+			    {
+			    	m.deleted.add(date);
+			    	if (m.validities.peekLast().validFrom.equals("#UNKNOWN#")) // triple is removed without being added first 
+						m.delete_anomalies.add(date);
+					else if (m.validities.peekLast().validUntil.equals("")) //do note remove already removed triples
+					{
+						m.validities.peekLast().validUntil=date;
+					}
+			    }
+			}
+		}
+    	
+    	Gson gson = new Gson(); 
+    	return gson.toJson(m);
+    	
+     }
+   
+    /*
     public static void handleStatement(Statement st, String date, boolean adding)
     {
     //parse Triple line
-//    	RethinkDB r = RethinkDB.r;
-//    	Connection conn=null; 
-//    	try {
-//			conn = r.connection().hostname("localhost").port(RETHINK_PORT).connect();
-//		} /*catch (TimeoutException e) {
-//			// TODO Auto-generated catch block
-//			e.printStackTrace();
-//			conn =null;
-//		} */ finally {}
     	String s = st.asTriple().getSubject().toString();
 		String p = st.asTriple().getPredicate().toString();
 		String o = st.asTriple().getObject().toString();
@@ -220,12 +262,12 @@ public class App
 		} 
 		//conn.close();
 		
-    }
+    }*/
     
     
     
     
-    public static void parseNTFile(Path file)
+    public static void handleNTFile(Path file)
     {
     //check whether it's an adding or removing file	
     	boolean tmp;
@@ -249,38 +291,19 @@ public class App
 		} 
     	final String date = date_tmp;
     	
-		Model model = ModelFactory.createDefaultModel();
-		    java.io.InputStream is = FileManager.get().open(file.toAbsolutePath().toString());
-		    
-		if (is != null) {
-			
-		    Model m = model.read(is, null, "N-TRIPLE"); //parse nt file
-		    
-		    //prepare stuff for parallel processing of the statements
-		    if (NUMBER_THREADS>0)
-		    	System.setProperty("java.util.concurrent.ForkJoinPool.common.parallelism", ""+NUMBER_THREADS);
-		    StmtIterator it = m.listStatements();
-		    Stream<Statement> targetStream = StreamSupport.stream(
-		    		Spliterators.spliteratorUnknownSize(it, Spliterator.ORDERED),false);
-
-		    //process the statements in parallel
-		    /*ForkJoinPool forkJoinPool = new ForkJoinPool(NUMBER_THREADS);
-			
-				try {
-					forkJoinPool.submit(() -> targetStream.parallel().forEach( s -> handleStatement(s, date, added))
-					    //parallel task here, for example
-					    
-					).get();
-				} catch (InterruptedException | ExecutionException e) {
-					// TODO Auto-generated catch block
-					e.printStackTrace();
-				}*/
-			targetStream.parallel().forEach( s -> handleStatement(s, date, added));
-		}
-	
-
-		
+    //MAP PHASE(S) HERE	
+    	DataSource<String> d1 = env.readTextFile(file.toString()); // mark that file as input for later evaluation phase
+    	DataSet<Tuple2<String,String>> d2 = d1.flatMap( //define the MAP FUNCTION
+    			(String s,Collector<Tuple2<String, String>> o) -> {
+    				if(s.charAt(0)!='#')
+    					o.collect(new Tuple2<String,String>(s,(added)?date+'a': date+'d')); 
+    			}
+    		).returns("Tuple2<String,String>");
+   
+    	d = (d==null) ? d2 : d.union(d2); // "copy" the data of that file to the global dataset
+ 
 	}
+	
     
     public void initConstantsFromPropValues() throws IOException {
     	InputStream inputStream = null;
