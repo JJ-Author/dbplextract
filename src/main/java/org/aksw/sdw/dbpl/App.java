@@ -3,8 +3,11 @@ package org.aksw.sdw.dbpl;
 import java.io.BufferedReader;
 import java.io.FileNotFoundException;
 import java.io.FileReader;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.Serializable;
+import java.io.Writer;
 import java.nio.file.FileVisitResult;
 import java.nio.file.FileVisitor;
 import java.nio.file.Files;
@@ -12,21 +15,30 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.text.ParsePosition;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Properties;
+import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
 
+import org.aksw.sdw.dbpl.Metadata.Validity;
+import org.apache.flink.api.common.JobExecutionResult;
+import org.apache.flink.api.common.accumulators.Histogram;
+import org.apache.flink.api.common.functions.RichGroupReduceFunction;
 import org.apache.flink.api.java.DataSet;
 import org.apache.flink.api.java.ExecutionEnvironment;
 import org.apache.flink.api.java.operators.DataSource;
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.fs.FileSystem.WriteMode;
 import org.apache.flink.util.Collector;
 import org.apache.log4j.Logger;
 
 import com.google.gson.Gson;
+import com.google.gson.internal.bind.util.ISO8601Utils;
 
 /**
  *
@@ -99,8 +111,11 @@ public class App
 		
 		// REDUCE PHASE 
 			  DataSet<String> result =  
-					  d.groupBy(0).reduceGroup( 
-							 (Iterable<Tuple2<String, String>> it,Collector<String> out)-> { 
+					  d.groupBy(0).reduceGroup( new RichGroupReduceFunction<Tuple2<String, String>, String>() {
+						  
+						 // Reduce Function
+						  	public void reduce(Iterable<Tuple2<String, String>> it,Collector<String> out) 
+						  	{ 						  		  
 								  Iterator<Tuple2<String, String>> itt = it.iterator();
 								  List<String> list = new ArrayList<>();
 								  Tuple2<String, String> t = itt.next();
@@ -108,27 +123,49 @@ public class App
 								  while(itt.hasNext()){
 								    list.add(itt.next().f1);
 								  }
-								  /*List<String> list = new ArrayList<>();
-								  it.forEach(x-> list.add(x.f0)); //copy the iterator to list to sort it*/
+								  
 								  Collections.sort(list);
-								  out.collect(tmp+retrieveMetadataString(list));
-							  }
+								  out.collect(tmp+retrieveMetadataString(list,this.histograms));
+							} 
+						  	
+						  	public void open(Configuration parameters) {	//register the histograms
+						  		getRuntimeContext().addAccumulator("deletes"			,histograms.deletes); 
+						  		getRuntimeContext().addAccumulator("adds"				,histograms.adds);
+						  		getRuntimeContext().addAccumulator("delAnnomalies"		,histograms.delAnnomalies);
+						  		getRuntimeContext().addAccumulator("addAnnomalies"		,histograms.addAnnomalies);
+						  		getRuntimeContext().addAccumulator("durations"			,histograms.durations);
+						  		
+						    }
+						  	App.Histograms histograms = new App.Histograms();
+
+						  }
 					  ).returns(String.class);
 			  try {
-//				System.out.println("map:");
-//				d.print();
-//				System.out.println("reduce:");
-//				result.print();
+
 				result.writeAsText("test.txt",WriteMode.OVERWRITE);//.setParallelism(1);
-				env.execute();
+				JobExecutionResult job = env.execute();
+				
+				
+				Gson gson = new Gson(); 
+				TreeMap deletes = job.getAccumulatorResult("deletes");
+				TreeMap adds = job.getAccumulatorResult("adds");
+				TreeMap addAnnomalies = job.getAccumulatorResult("addAnnomalies");
+				TreeMap delAnnomalies = job.getAccumulatorResult("delAnnomalies");
+				TreeMap durations = job.getAccumulatorResult("durations");
+				try (Writer writer = new FileWriter("stats.json")) {
+				    writer.write("{ \"deletes\":");gson.toJson(deletes, writer);
+				    writer.write("\n,\"adds\":"); gson.toJson(adds, writer); 
+				    writer.write("\n,\"addAnnomalies\":"); gson.toJson(addAnnomalies, writer); 
+				    writer.write("\n,\"delAnnomalies\":"); gson.toJson(delAnnomalies, writer); 
+				    writer.write("\n,\"durations\":"); gson.toJson(durations, writer);
+				    writer.write("\n}");				}
+
+				
 			} catch (Exception e) {
 				// TODO Auto-generated catch block
 				System.out.println("ERROR:");
 				e.printStackTrace();
 			}
-			  
-			  
-			 // Collector<Tuple2<String, Integer>>
 	    } catch (IOException e) {
 	      e.printStackTrace();
 	    }
@@ -136,17 +173,13 @@ public class App
     }
     
     
-    
-    public static String retrieveMetadataString(List<String> list)
+    public static String retrieveMetadataString(List<String> list,App.Histograms h)
     {
-    	
-    	
-    
     	Metadata m = new Metadata();
     	for (String s : list) 
     	{
 			boolean adding = s.charAt(s.length()-1) == 'a';
-			String date = s.substring(0, s.length()-2);
+			String date = s.substring(0, s.length()-1);
 			
 			if(m.validities.size()==0) // if validity list is empty
 			{
@@ -186,87 +219,41 @@ public class App
 			}
 		}
     	
+    	//calculate the validity duration  for each validity entry
+    	for ( Validity v : m.validities) 
+    	{
+    		int days = -1;
+    		try {
+    			long diff = ISO8601Utils.parse(v.validUntil,new ParsePosition(0)).getTime() - ISO8601Utils.parse(v.validFrom,new ParsePosition(0)).getTime();
+    			days = (int) TimeUnit.DAYS.convert(diff, TimeUnit.MILLISECONDS); // no leap years, daylight time and so on ...
+			} catch (Exception e) {
+			}
+    		finally {
+				h.durations.add(days);
+				m.durations.add(days);
+			}
+		}
+    	
+    	
+    	 h.deletes.add(m.deleted.size());
+    	 h.adds.add(m.added.size());
+    	 h.delAnnomalies.add(m.delete_anomalies.size());
+    	 h.addAnnomalies.add(m.add_anomalies.size());
+    	
     	Gson gson = new Gson(); 
     	return gson.toJson(m);
     	
      }
-   
-    /*
-    public static void handleStatement(Statement st, String date, boolean adding)
+    
+    protected static class Histograms implements Serializable
     {
-    //parse Triple line
-    	String s = st.asTriple().getSubject().toString();
-		String p = st.asTriple().getPredicate().toString();
-		String o = st.asTriple().getObject().toString();
-		
-		String hash = ""+(s+p+o).hashCode();
-		
-		boolean statement_exists = false;
-		
-	//check if statement already exists and fetch it if so
-		Cursor<HashMap> cursor = r.db("dbplextract").table("dbpl16").getAll(r.array(s,p,o)).optArg("index", "spo").run(conn);//filter(row -> row.g("hash").eq(hash)).run(conn); 
-		HashMap doc=null; 
-		for ( HashMap doc2 : cursor) {
-			statement_exists = true; doc=doc2;		    
-		}
-		MapObject m;
-	//parse statement data from db and update it 
-		if (statement_exists)
-		{
-			
-			ArrayList validity_list = (ArrayList) ((List) doc.get("validity"));
-		    HashMap last_valid_entry = (HashMap) validity_list.get(validity_list.size()-1); //get last validEntry
-		    String last_valid_from = (String) last_valid_entry.get("validFrom"); 
-		    String last_valid_until = (String) last_valid_entry.get("validUntil");
-		    ArrayList<String> added = (ArrayList) ((List) doc.get("added"));
-		    ArrayList<String> removed = (ArrayList) ((List) doc.get("deleted"));
-		    if (adding)
-			{
-		    	added.add(date);
-				if (last_valid_until.equals("")) // triple is re-added  without being removed 
-					;
-				else
-				{
-					validity_list.add(r.hashMap("validFrom", date).with("validUntil", ""));
-				}
-			}
-		    else
-		    {
-		    	removed.add(date);
-		    	if (last_valid_from.equals("#UNKNOWN#")) // triple is removed  without being added first 
-					;
-				else if (last_valid_until.equals("")) //do note remove already removed triples
-				{
-					last_valid_entry.put("validUntil", date);
-					validity_list.set(validity_list.size()-1, last_valid_entry);
-				}
-		    }
-
-		    r.db("dbplextract").table("dbpl16").replace(doc).run(conn);
-		   
-		}
-	//insert statement information for the first time
-		else
-		{	
-			 m = r.hashMap("hash", hash)
-		     .with("s", s)
-		     .with("p", p)
-		     .with("o", o); 
-
-			 if (adding)
-				 m = m.with("validity", r.array(r.hashMap("validFrom", date).with("validUntil", ""))).with("added", r.array(date)).with("deleted", r.array());
-			 else
-				 m = m.with("validity", r.array(r.hashMap("validFrom", "#UNKNOWN#").with("validUntil", date))).with("added", r.array()).with("deleted", r.array(date));
-			 
-			 r.db("dbplextract").table("dbpl16").insert(m).run(conn);
-		} 
-		//conn.close();
-		
-    }*/
-    
-    
-    
-    
+    	Histogram deletes = new Histogram();
+    	Histogram adds = new Histogram();
+    	Histogram delAnnomalies = new Histogram();
+    	Histogram addAnnomalies = new Histogram();
+    	Histogram durations = new Histogram();
+    }
+   
     public static void handleNTFile(Path file)
     {
     //check whether it's an adding or removing file	
